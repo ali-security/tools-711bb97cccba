@@ -1,0 +1,116 @@
+name: seal-build
+
+# Authored for the sealed build: golang.org/x/tools has no GitHub Actions CI
+# (upstream tests on the Go build dashboard). Mirrors the project's own
+# `go build ./...` + `go test ./...` on the Go release contemporary with this
+# June 2019 snapshot (Go 1.12; go.mod declares go 1.11).
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: Space-separated top-level test names to run instead of the full suite
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  MODULE_PATH: golang.org/x/tools
+  MODULE_VERSION: v0.0.0-20190621195816-6e04913cbbac
+  GO111MODULE: "on"
+  GOPROXY: https://proxy.golang.org
+
+jobs:
+  module-zip:
+    name: module zip
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: false
+      - name: Build the x/mod zip helper outside the checkout
+        run: |
+          set -eux
+          HELPER="$(mktemp -d)"
+          cp .github/create_mod.go "$HELPER/main.go"
+          cd "$HELPER"
+          GO111MODULE=on go mod init example.com/mod
+          GO111MODULE=on go get golang.org/x/mod@v0.24.0
+          GO111MODULE=on go build -o "$RUNNER_TEMP/create_mod" .
+      - name: Create the module zip (sealed workflow files excluded)
+        run: |
+          set -eux
+          mkdir -p "$RUNNER_TEMP/zipsrc" "$RUNNER_TEMP/out"
+          tar -c --exclude=.git --exclude=.github -C "$GITHUB_WORKSPACE" . | tar -x -C "$RUNNER_TEMP/zipsrc"
+          test ! -e "$RUNNER_TEMP/zipsrc/.github"
+          test -f "$RUNNER_TEMP/zipsrc/go.mod"
+          test -f "$RUNNER_TEMP/zipsrc/.gitignore"
+          test -f "$RUNNER_TEMP/zipsrc/.gitattributes"
+          "$RUNNER_TEMP/create_mod" "$MODULE_PATH" "$MODULE_VERSION" "$RUNNER_TEMP/zipsrc" "$RUNNER_TEMP/out/$MODULE_VERSION.zip"
+          unzip -Z1 "$RUNNER_TEMP/out/$MODULE_VERSION.zip" | wc -l
+          unzip -l "$RUNNER_TEMP/out/$MODULE_VERSION.zip" | tail -1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v0.0.0-20190621195816-6e04913cbbac.zip
+          if-no-files-found: error
+
+  test:
+    name: test (${{ matrix.os }}, go ${{ matrix.go }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        go: ["1.12"]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Keep line endings byte-exact on Windows
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+      - name: Install msvcrt mingw-w64 for cgo (Windows)
+        # Go 1.12's runtime/cgo references __imp___iob_func, which the runner's
+        # UCRT-based gcc 15 no longer provides; use the msvcrt-based gcc 8.1.0.
+        if: runner.os == 'Windows'
+        run: |
+          set -eux
+          choco install mingw --version 8.1.0 -y --no-progress --force
+          echo 'C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin' >> "$GITHUB_PATH"
+      - name: Build
+        run: |
+          set -eux
+          go version
+          go env CC CGO_ENABLED
+          if [ "$RUNNER_OS" = Windows ]; then gcc --version | grep -F 8.1.0; fi
+          go build ./...
+      - name: Test
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          set -eux -o pipefail
+          if [ -n "$TEST_FILTER" ]; then
+            go test -v -run "^($(echo "$TEST_FILTER" | tr ' ' '|'))$" ./... 2>&1 | tee "$RUNNER_TEMP/scoped.log"
+            for t in $TEST_FILTER; do grep -qE "^=== RUN[[:space:]]+${t}(/|$)" "$RUNNER_TEMP/scoped.log"; done
+          else
+            # -p 1: cmd/godoc TestWebIndex must index GOROOT within 2m; run
+            # packages serially so the go/packages stdlib loads don't starve it.
+            go test -p 1 -v ./... 2>&1 | tee "$RUNNER_TEMP/full.log"
+            set +x
+            passed=$(grep -c -- '^--- PASS' "$RUNNER_TEMP/full.log")
+            failed=$(grep -c -- '^--- FAIL' "$RUNNER_TEMP/full.log" || [ $? -eq 1 ])
+            skipped=$(grep -c -- '^--- SKIP' "$RUNNER_TEMP/full.log" || [ $? -eq 1 ])
+            pkgs_ok=$(grep -cE '^ok[[:space:]]' "$RUNNER_TEMP/full.log")
+            echo "TEST SUMMARY: ${passed} passed, ${failed} failed, ${skipped} skipped (${pkgs_ok} packages ok)"
+          fi
